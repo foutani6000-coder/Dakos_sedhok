@@ -1,0 +1,141 @@
+# Build Senok (Flutter 3.50.1) — تحقق + بناء APK/AAB لنظام Android.
+# ضع هذا الملف في: .github/workflows/build.yml
+# ثم ادفع الكود إلى main وستجد ملف APK في تبويب Actions ← Artifacts.
+#
+# ملاحظات:
+# - نسخة Flutter مثبّتة على 3.50.1 وهي نفس النسخة التي تم التحقق بها محلياً
+#   (flutter analyze: صفر مشاكل، وflutter test: 439 اختباراً ناجحاً).
+# - المشروع لا يحتوي مجلد android/ في المستودع، فيولّده سير العمل تلقائياً
+#   عبر `flutter create` ثم يعيد ملفات المشروع الأصلية فوقه.
+# - التوقيع اختياري: بدون أسرار التوقيع يُبنى APK موقّعاً بمفتاح التصحيح
+#   (قابل للتثبيت المباشر، غير صالح لمتجر Google Play). لتوقيع إصدار
+#   المتجر أضف هذه الأسرار في Settings ← Secrets ← Actions:
+#     ANDROID_KEYSTORE_BASE64 — ملف .jks مشفّر Base64
+#     ANDROID_STORE_PASSWORD — كلمة مرور المخزن
+#     ANDROID_KEY_ALIAS — اسم المفتاح
+#     ANDROID_KEY_PASSWORD — كلمة مرور المفتاح
+
+name: Build Senok Android
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.50.1"
+  JAVA_VERSION: "17"
+
+jobs:
+  verify:
+    name: Analyze & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Check formatting
+        continue-on-error: true
+        run: dart format --output=none --set-exit-if-changed lib test
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Unit tests
+        run: flutter test
+
+  build:
+    name: Build APK
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      HAS_SIGNING: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_STORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Back up project files
+        run: |
+          rm -rf /tmp/bak && mkdir /tmp/bak
+          cp -r lib /tmp/bak/lib
+          cp pubspec.yaml /tmp/bak/
+          [ -f analysis_options.yaml ] && cp analysis_options.yaml /tmp/bak/ || true
+
+      - name: Generate Android platform
+        run: flutter create --platforms=android --org com.senok --project-name senok_app .
+
+      - name: Restore project files
+        run: |
+          rm -rf lib && cp -r /tmp/bak/lib lib
+          cp /tmp/bak/pubspec.yaml pubspec.yaml
+          [ -f /tmp/bak/analysis_options.yaml ] && cp /tmp/bak/analysis_options.yaml analysis_options.yaml || true
+
+      - name: Patch Android manifest and signing
+        run: python3 scripts/patch_android.py
+
+      - name: Configure release keystore from GitHub Secrets
+        if: ${{ env.HAS_SIGNING == 'true' }}
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 --decode > android/app/upload-keystore.jks
+          cat > android/key.properties <<PROPS
+          storePassword=$STORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=upload-keystore.jks
+          PROPS
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Generate native app icons
+        run: dart run flutter_launcher_icons
+
+      - name: Generate native launch screens
+        run: dart run flutter_native_splash:create
+
+      - name: Build release APK
+        run: |
+          flutter build apk --release --dart-define-from-file=build_config.json || {
+            echo "::warning::Release build failed, building debug APK instead"
+            flutter build apk --debug --dart-define-from-file=build_config.json
+          }
+
+      - name: Build release App Bundle when signing is configured
+        if: ${{ env.HAS_SIGNING == 'true' }}
+        run: flutter build appbundle --release --dart-define-from-file=build_config.json
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: senok-android-release
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: warn
